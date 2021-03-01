@@ -4,6 +4,9 @@ import numpy as np
 import os
 import pandas as pd
 import sharpy.utils.algebra as algebra
+import matplotlib.pyplot as plt
+
+from scipy.optimize import fsolve
 
 
 case_name = 'simple_wing_fuselage'
@@ -20,6 +23,8 @@ flow = ['BeamLoader',
         'BeamLoads',
         'AerogridPlot',
         'BeamPlot',
+        'AeroForcesCalculator',
+        'LiftDistribution',
         #'DynamicCoupled',
         # 'Modal',
         # 'LinearAssember',
@@ -36,11 +41,11 @@ rho = 1.225
 free_flight = True
 if not free_flight:
     case_name += '_prescribed'
-    amplitude = 0*np.pi/180
+    amplitude = 1.8*np.pi/180
     period = 3
     case_name += '_amp_' + str(amplitude).replace('.', '') + '_period_' + str(period)
 
-alpha = 0.0*np.pi/180
+alpha = 1.8*np.pi/180
 beta = 0
 roll = 0
 gravity = 'on'
@@ -62,8 +67,22 @@ fsi_tolerance = 1e-4
 num_cores = 4
 
 # MODEL GEOMETRY
+# fuselage
+thickness_ratio_ellipse = 7
+length_fuselage = 10 #7.5*radius_fuselage*2
+radius_fuselage = length_fuselage/thickness_ratio_ellipse/2
+offset_fuselage_vertical = 0
+offset_fuselage_wing = 4
+#radius_fuselage = length_fuselage/thickness_ratio_ellipse
+list_cylinder_position_fuselage = [0.2, 0.8] # percent where fuselage has cylinder shape
+sigma_fuselage = 10
+m_bar_fuselage = 0.2
+j_bar_fuselage = 0.08
+# aero
+aspect_ratio = 5.
+chord_main = length_fuselage/5
 # beam
-span_main = 3.0
+span_main = chord_main*aspect_ratio/2p #8.8/2
 ea_main = 0.3
 
 ea = 1e7
@@ -73,17 +92,7 @@ eiy = 2e4
 eiz = 4e6
 m_bar_main = 0.75
 j_bar_main = 0.075
-
-length_fuselage = 10
-offset_fuselage_vertical = 0
-offset_fuselage_wing = 4
-thickness_ratio_ellipse= 8
-radius_fuselage = length_fuselage/thickness_ratio_ellipse
-list_cylinder_position_fuselage = [0.5, 0.5] # percent where fuselage has cylinder shape
-sigma_fuselage = 10
-m_bar_fuselage = 0.2
-j_bar_fuselage = 0.08
-
+print("chord = ", chord_main, "\n wing span = ", span_main, "\n fuselage radius = ", radius_fuselage)
 # lumped masses
 n_lumped_mass = 1
 lumped_mass_nodes = np.zeros((n_lumped_mass, ), dtype=int)
@@ -93,16 +102,14 @@ lumped_mass_inertia = np.zeros((n_lumped_mass, 3, 3))
 lumped_mass_position = np.zeros((n_lumped_mass, 3))
 lumped_mass_position[0] = offset_fuselage_wing
 
-# aero
-chord_main = 1.0
 
 # DISCRETISATION
 # spatial discretisation
 # chordiwse panels
-m = 4
+m = 8
 m_radial_elem_fuselage =24
 # spanwise elements
-n_elem_multiplier = 2
+n_elem_multiplier = 8
 n_elem_main = int(2*n_elem_multiplier) #int(4*n_elem_multiplier)
 n_elem_fuselage = 21
 n_surfaces = 2
@@ -177,7 +184,7 @@ twist = np.zeros((n_elem, n_node_elem))
 sweep = np.zeros((n_elem, n_node_elem))
 chord = np.zeros((n_elem, n_node_elem,))
 elastic_axis = np.zeros((n_elem, n_node_elem,))
-boundary_conditions_aero = np.zeros((n_node, ), dtype=int)
+junction_boundary_condition_aero = np.zeros((n_node, ), dtype=int)
 
 # nonlifting body
 nonlifting_body_distribution = np.zeros((n_elem,), dtype=int) - 1
@@ -209,7 +216,7 @@ def generate_fem():
     # inner right wing
     beam_number[we:we + n_elem_main] = 0
     x[wn:wn + n_node_main] = offset_fuselage_wing
-    y[wn:wn + n_node_main] = np.linspace(0, span_main, n_node_main)
+    y[wn:wn + n_node_main] = np.linspace(0, span_main-radius_fuselage, n_node_main)
     y[wn:wn + n_node_main] += radius_fuselage
     for ielem in range(n_elem_main):
         conn[we + ielem, :] = ((np.ones((3, ))*(we + ielem)*(n_node_elem - 1)) +
@@ -217,17 +224,18 @@ def generate_fem():
         for inode in range(n_node_elem):
             frame_of_reference_delta[we + ielem, inode, :] = [-1.0, 0.0, 0.0]
 
+    print("Wing y coordinate")
+    print(y[wn:wn + n_node_main])
     elem_stiffness[we:we + n_elem_main] = 0
     elem_mass[we:we + n_elem_main] = 0
     boundary_conditions[wn] = 1
     boundary_conditions[wn + n_elem_main] = -1
     we += n_elem_main
     wn += n_node_main
-
     # inner left wing
     beam_number[we:we + n_elem_main] = 1
     x[wn:wn + n_node_main] = offset_fuselage_wing
-    y[wn:wn + n_node_main] = np.linspace(0, -span_main, n_node_main)
+    y[wn:wn + n_node_main] = np.linspace(0, -(span_main-radius_fuselage), n_node_main)
     y[wn:wn + n_node_main] -= radius_fuselage
     for ielem in range(n_elem_main):
         conn[we + ielem, :] = ((np.ones((3, ))*(we+ielem)*(n_node_elem - 1)) +
@@ -246,7 +254,7 @@ def generate_fem():
     beam_number[we:we + n_elem_fuselage] = 2
     delta_beta = np.pi/(n_node_fuselage-2)
     beta = np.arange(0, np.pi, delta_beta)
-    # x[wn:wn + n_node_fuselage] = length_fuselage/2*(1-np.cos(beta)) # np.linspace(0.0, length_fuselage, n_node_fuselage-2)
+    #x[wn:wn + n_node_fuselage] = length_fuselage/2*(1-np.cos(beta)) # np.linspace(0.0, length_fuselage, n_node_fuselage-2)
     x[wn:wn + n_node_fuselage] = np.linspace(0.0, length_fuselage, n_node_fuselage-2)
     z[wn:wn + n_node_fuselage] = np.linspace(0.0, offset_fuselage_vertical, n_node_fuselage-2)
     # np.savetxt("x_coordinates_1.csv", x[wn:wn + n_node_fuselage], delimiter=",")
@@ -317,7 +325,7 @@ def generate_aero_file():
     wn = 0
     # right wing (surface 0, beam 0)
     i_surf = 0
-    boundary_conditions_aero[wn] = 1 # BC at fuselage junction that Zirkulation = Zirkulation
+    junction_boundary_condition_aero[wn] = 1 # BC at fuselage junction that Zirkulation = Zirkulation
     airfoil_distribution[we:we + n_elem_main, :] = 0
     surface_distribution[we:we + n_elem_main] = i_surf
     surface_m[i_surf] = m
@@ -338,7 +346,7 @@ def generate_aero_file():
 
     # left wing (surface 1, beam 1)
     i_surf = 1
-    boundary_conditions_aero[wn] = 1 # BC at fuselage junction
+    junction_boundary_condition_aero[wn] = 1 # BC at fuselage junction
     airfoil_distribution[we:we + n_elem_main, :] = 0
     surface_distribution[we:we + n_elem_main] = i_surf
     surface_m[i_surf] = m
@@ -389,7 +397,7 @@ def generate_aero_file():
         elastic_axis_input = h5file.create_dataset('elastic_axis', data=elastic_axis)
 
         bocos_handle = h5file.create_dataset(
-            'boundary_conditions', data=boundary_conditions_aero)
+            'junction_boundary_condition', data=junction_boundary_condition_aero)
 
 def generate_nonlifting_body_file():
     we = 0
@@ -411,6 +419,9 @@ def generate_nonlifting_body_file():
     nonlifting_body_distribution[we:we + n_elem_fuselage] = i_body
     nonlifting_body_m[i_body] = m_radial_elem_fuselage
     radius[wn:wn + n_node_fuselage] = get_ellipsoidal_geometry(x[wn:wn + n_node_fuselage], thickness_ratio_ellipse,0) #np.genfromtxt('radius_wanted.csv',delimiter=',')
+    #radius[wn:wn + n_node_fuselage] = create_fuselage_geometry()
+    np.savetxt("radius_fuselage_uncorrected.csv",radius[wn:wn + n_node_fuselage], delimiter = ",")
+    #radius[wn:wn + n_node_fuselage] = adjust_curve_tangency(x[wn:wn + n_node_fuselage], radius[wn:wn + n_node_fuselage], list_cylinder_position_fuselage[0]*length_fuselage, radius_fuselage, 0.3)
     plt.plot(x[wn:wn + n_node_fuselage], radius[wn:wn + n_node_fuselage], "x-")
     plt.grid()
     plt.xlabel("x [m]")
@@ -420,7 +431,8 @@ def generate_nonlifting_body_file():
     plt.show()
     print(x[wn:wn + n_node_fuselage])
     print(radius[wn:wn + n_node_fuselage])
-    # np.savetxt("radius_fuselage.csv",radius[wn:wn + n_node_fuselage], delimiter = ",")
+    np.savetxt("x_fuselage.csv",x[wn:wn + n_node_fuselage], delimiter = ",")
+    np.savetxt("radius_fuselage.csv",radius[wn:wn + n_node_fuselage], delimiter = ",")
     with h5.File(route + '/' + case_name + '.nonlifting_body.h5', 'a') as h5file:
         nonlifting_body_m_input = h5file.create_dataset('surface_m', data=nonlifting_body_m)
         nonlifting_body_node_input = h5file.create_dataset('nonlifting_body_node', data=nonlifting_body_node)
@@ -448,6 +460,7 @@ def get_ellipsoidal_geometry(x_nodes, thickness_ratio_ellipse,offset_horiz_axis_
             print(x, x-x_center, a)
     radius = offset_horiz_axis_ellipse + b*np.sqrt(1-(x_nodes-x_center)**2/a**2)
     radius[-1] = 0.0
+    print(x_nodes)
     return radius
 
 def generate_naca_camber(M=0, P=0):
@@ -470,18 +483,29 @@ def find_index_of_closest_entry(array_values, target_value):
     return (np.abs(array_values - target_value)).argmin()
 
 def create_ellipsoid(x_geom, a, b, flip):
-    x_geom -= x_geom.min()
+    # print("x_geom, a, b, flip")
+    # print(x_geom, a, b, flip)
+    len_initial = len(x_geom)
+    x_geom -= x_geom.max()
+    if not flip:
+        x_geom = np.flip(x_geom)
+    np.append(x_geom,np.flip(-x_geom))
     y = b*np.sqrt(1-(x_geom/a)**2)
-    if flip:
-        y = np.flip(y.tolist())
-    return y
+    if not flip:
+        return y[:len_initial]
+    else:
+        return y[:len_initial]
 
 def add_nose_or_tail_shape(idx, array_x, nose = True):
     if nose:
-        shape = create_ellipsoid(array_x[:idx], array_x[idx] - array_x[0], radius_fuselage, True)
+        x_nose = np.append(array_x[:idx],length_fuselage*list_cylinder_position_fuselage[0])
+        shape = create_ellipsoid(x_nose, x_nose[-1] - x_nose[0], radius_fuselage, True)
+        shape = shape[:-1]
     if not nose:
         #TO-DO: Add paraboloid shaped tail
-        shape = create_ellipsoid(array_x[idx:], array_x[-1]-array_x[idx], radius_fuselage, False)
+        x_tail = np.insert(array_x[idx:],0,length_fuselage*list_cylinder_position_fuselage[1])
+        shape = create_ellipsoid(x_tail, x_tail[-1]-x_tail[0], radius_fuselage, False)
+        shape = shape[1:]
     return shape
 
 def create_fuselage_geometry():
@@ -489,13 +513,89 @@ def create_fuselage_geometry():
     x_fuselage = x[nonlifting_body_node]
     fuselage_length = max(x_fuselage)-min(x_fuselage) # useful??
     idx_cylinder_start = find_index_of_closest_entry(x_fuselage, list_cylinder_position_fuselage[0]*fuselage_length)
+    print("x nose")
+    print(idx_cylinder_start)
+    print(x_fuselage[:idx_cylinder_start])
     idx_cylinder_end = find_index_of_closest_entry(x_fuselage,list_cylinder_position_fuselage[1]*fuselage_length)
+    print("x tail")
+    print(idx_cylinder_end)
+    print(x_fuselage[:idx_cylinder_end])
     # set constant radius of cylinder
     array_radius[idx_cylinder_start:idx_cylinder_end] = radius_fuselage
     # set r(x) for nose and tail region
     array_radius[:idx_cylinder_start] = add_nose_or_tail_shape(idx_cylinder_start, x_fuselage, nose = True)
+    print("\n \n -------------------- \n Check Symmetry: ", list_cylinder_position_fuselage[0], " == ", round(1- list_cylinder_position_fuselage[1],1))
+    """if list_cylinder_position_fuselage[0] == round(1- list_cylinder_position_fuselage[1],1):
+        print("Symmetry!")
+        idx_cylinder_end = len(x_fuselage)-idx_cylinder_start
+        array_radius[idx_cylinder_end:] = np.flip(array_radius[:idx_cylinder_start])
+    else:"""
     array_radius[idx_cylinder_end:] = add_nose_or_tail_shape(idx_cylinder_end, x_fuselage, nose = False)
+    if array_radius[0] != 0.0:
+        array_radius[1:idx_cylinder_start+1] = array_radius[:idx_cylinder_start]
+        array_radius[0] = 0.0
+    if array_radius[-2] == 0.0:
+        array_radius[idx_cylinder_end:] =  array_radius[idx_cylinder_end-1:-1]
     return array_radius
+
+
+def func_ellipse(x,a,b):
+    x -= a
+    return b*np.sqrt(1-x**2/a**2)
+
+def func_ellipse_first_deriv(x,a,b):
+    x -= a
+    return -x*b/(a**2*np.sqrt(1 - x**2/a**2))
+
+def func_ellipse_second_deriv(x,a,b):
+    x -= a
+    return -b/(a**2*np.sqrt(1 - x**2/a**2)) - x**2*b/(a**4*(1 - x**2/a**2)**(3/2))
+
+def func_fit(c,x):
+    c1, c2, c3, c4, c5, c6 = c
+    return c1*x**5+ c2*x**4 + c3*x**3 + c4*x**2 + c5*x + c6
+    # return c2*x**4 + c3*x**3 + c4*x**2 + c5*x + c6
+def func_fit_first_deriv(c,x):
+    c1, c2, c3, c4, c5, c6 = c
+    return 5*c1*x**4+ 4*c2*x**3 + 3*c3*x**2 + 2*c4*x + c5
+    # return 5*c1*x**4+3*c3*x**2 + 2*c4*x + c5
+
+def func_fit_second_deriv(c,x):
+    c1, c2, c3, c4, c5, c6 = c
+    return 20*c1*x**3+ 12*c2*x**2 + 6*c3*x + 2*c4
+    # return 12*c2*x**2 + 6*c3*x + 2*c4
+
+def func_optimize(a,b, x_start):
+    def equations(c, *args):
+        a, b, x_start = args
+        x_start *= a
+        c1, c2, c3, c4, c5, c6 = c
+        bc1 = func_fit(c,x_start)-func_ellipse(x_start,a,b) 
+        bc2 = func_fit_first_deriv(c,x_start)-func_ellipse_first_deriv(x_start,a,b)
+        bc3 = func_fit_second_deriv(c,x_start)-func_ellipse_second_deriv(x_start,a,b)
+
+        bc4 = func_fit(c,a) - b
+        bc5 = func_fit_first_deriv(c,a)
+        bc6 = func_fit_second_deriv(c,a)
+
+        return(bc1,bc2,bc3,bc4,bc5,bc6)
+
+    c1,c2,c3,c4,c5,c6 =  fsolve(equations, (0,0,0,0,0,0), args =(a,b,x_start))
+    return tuple([c1,c2,c3,c4,c5,c6])
+
+def adjust_curve_tangency(x_array, r_array, a, b, x_start):
+    # nose
+    coefficients = func_optimize(a,b, x_start)
+    filter_array = (a*x_start <= x_array)*(x_array<=a)
+    print(a, a*x_start, x_array[filter_array])
+    r_array[filter_array] = func_fit(coefficients,x_array[filter_array])
+    # tail    """
+    if list_cylinder_position_fuselage[0] == round(1- list_cylinder_position_fuselage[1],1):
+        print("Symmetry!")
+        idx_cylinder_start = find_index_of_closest_entry(x_array, list_cylinder_position_fuselage[0]*length_fuselage)
+        idx_cylinder_end = len(x_array)-idx_cylinder_start
+        r_array[idx_cylinder_end:] = np.flip(r_array[:idx_cylinder_start])    
+    return r_array
 
 
 def generate_dyn_file():
@@ -572,7 +672,7 @@ def generate_solver_file():
                                                                           beta]))}
     settings['AerogridLoader'] = {'unsteady': 'on',
                                   'aligned_grid': 'on',
-                                  'mstar': int(20/tstep_factor),
+                                  'mstar': int(20/tstep_factor)*20,
                                   'freestream_dir': ['1', '0', '0']}
     settings['NonliftingbodygridLoader'] = {'unsteady': 'on',
                                   'aligned_grid': 'on',
@@ -700,6 +800,9 @@ def generate_solver_file():
                             'include_applied_forces': 'on',
                             'include_forward_motion': 'on'}
 
+    settings['LiftDistribution'] = {'folder': route + '/output/',
+                                    'normalise': True}
+
     settings['AerogridPlot'] = {'folder': route + '/output/',
                                 'include_rbm': 'on',
                                 'include_forward_motion': 'off',
@@ -707,7 +810,13 @@ def generate_solver_file():
                                 'minus_m_star': 0,
                                 'u_inf': u_inf,
                                 'dt': dt}
-
+    settings['AeroForcesCalculator'] = {'print_info': True,
+                                    'normalise': False}
+    settings['LiftDistribution'] = {'folder': route + '/output/',
+                                    'normalise': True,
+                                    'q_ref': 0.5*rho*u_inf**2,
+                                    'write_text_file': True}
+    print("Q_ref = ", settings['LiftDistribution']['q_ref'])
     settings['Modal'] = {'print_info': True,
                      'use_undamped_modes': True,
                      'NumLambda': 30,
